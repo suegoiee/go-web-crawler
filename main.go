@@ -59,7 +59,7 @@ var (
 	imageDir string = "files/download"
 )
 
-func init() {
+func main() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("無法讀取 .env 檔案:", err)
@@ -105,9 +105,7 @@ func init() {
 	}
 
 	svc = s3.New(sess)
-}
 
-func main() {
 	workerPoolSize := 10
 	workerPool := make(chan struct{}, workerPoolSize)
 
