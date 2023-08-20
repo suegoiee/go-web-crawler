@@ -24,7 +24,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-type YahooNews struct {
+type News struct {
 	Title   string      `json:"title"`
 	Time    string      `json:"time"`
 	Content string      `json:"content"`
@@ -62,7 +62,7 @@ var (
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("無法讀取 .env 檔案:", err)
+		log.Fatal("Unable to load .env:", err)
 	}
 
 	mongoConfig := MongoConfig{
@@ -73,7 +73,7 @@ func main() {
 	}
 
 	credential := options.Credential{
-		Username: "admin",
+		Username: mongoConfig.Username,
 		Password: mongoConfig.Password,
 	}
 
@@ -109,11 +109,12 @@ func main() {
 	workerPoolSize := 10
 	workerPool := make(chan struct{}, workerPoolSize)
 
+	// Set a 30 second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	url := "https://tw.stock.yahoo.com/news/"
-	getYahooNews(url, 1, workerPool, ctx)
+	url := os.Getenv("TARGETURL")
+	getNews(url, 1, workerPool, ctx)
 
 	// Wait for the specified timeout duration
 	select {
@@ -122,7 +123,7 @@ func main() {
 	}
 }
 
-func getYahooNews(url string, lap int, workerPool chan struct{}, ctx context.Context) {
+func getNews(url string, lap int, workerPool chan struct{}, ctx context.Context) {
 	if lap >= 3 {
 		return
 	}
@@ -139,20 +140,18 @@ func getYahooNews(url string, lap int, workerPool chan struct{}, ctx context.Con
 		log.Fatal(err)
 	}
 
-	results := make(map[string]bool)
+	urlList := make(map[string]bool)
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
-		if exists {
-			if linkFilter(href) {
-				results[href] = true
-			}
+		if exists && linkFilter(href) {
+			urlList[href] = true
 		}
 	})
 
 	var wg sync.WaitGroup
 	newsList := make([]interface{}, 0)
 
-	for link := range results {
+	for link := range urlList {
 		// Acquire a worker slot from the worker pool
 		workerPool <- struct{}{}
 		wg.Add(1)
@@ -171,7 +170,7 @@ func getYahooNews(url string, lap int, workerPool chan struct{}, ctx context.Con
 		if count > 0 {
 			return
 		} else {
-			getYahooNews(link, lap, workerPool, ctx)
+			getNews(link, lap, workerPool, ctx)
 		}
 
 		go func(des string, ctx context.Context) {
@@ -193,7 +192,7 @@ func getYahooNews(url string, lap int, workerPool chan struct{}, ctx context.Con
 					log.Fatal(err)
 				}
 
-				var news YahooNews
+				var news News
 				nextDoc.Find("h1").Each(func(i int, s *goquery.Selection) {
 					newsTitle, exists := s.Attr("data-test-locator")
 					if newsTitle == "headline" && exists {
@@ -271,7 +270,7 @@ func getYahooNews(url string, lap int, workerPool chan struct{}, ctx context.Con
 
 				news.Content = nextDoc.Find("div.caas-body").Text()
 				news.Images = newsImages
-				news.Source = "Yahoo"
+				news.Source = os.Getenv("CRAWLURLSOURCE")
 				news.Link = des
 				newsList = append(newsList, news)
 			}
@@ -304,14 +303,14 @@ func mimeToExtension(contentType string) string {
 	}
 }
 
+// Filter for ads and relative path
 func linkFilter(href string) bool {
 	// Check if the link is a news link based on specific criteria
 	linkExists := strings.Contains(href, "/news/")
 	domainExists := strings.Contains(href, "https://")
-	yahooExists := strings.Contains(href, "yahoo")
 
 	// Filter out unnecessary content by defining your criteria
-	if linkExists && domainExists && yahooExists {
+	if linkExists && domainExists {
 		return true
 	} else if !domainExists && linkExists {
 		return true
