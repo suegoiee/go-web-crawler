@@ -1,7 +1,5 @@
 # go-web-crawler (news)
 
-![Project Banner](path/to/your/banner/image.png)
-
 Welcome to the Web Crawler Project! This repository showcases a news website crawler built using Go. The project focuses on web scraping, data storage, concurrency with Goroutines, and integration with MongoDB and AWS S3.
 
 ## Table of Contents
