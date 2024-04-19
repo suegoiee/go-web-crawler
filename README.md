@@ -41,7 +41,7 @@ The Web Crawler Project demonstrates a news website crawler written in Go. This 
 
 ```bash
 git clone https://github.com/suegoiee/news-crawler.git
-cd news-crawler
+cd go-web-crawler
 ```
    
 2. Install required dependencies:
