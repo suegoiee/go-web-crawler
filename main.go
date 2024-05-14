@@ -1,17 +1,20 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+
 	"sync"
 	"time"
+
+	"josh/goCrawler/AWSStorage"
+	"josh/goCrawler/Database"
+	"josh/goCrawler/LocalStorage"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/aws/aws-sdk-go/aws"
@@ -19,9 +22,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/joho/godotenv"
-	"go.mongodb.org/mongo-driver/bson"
+
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type News struct {
@@ -37,7 +39,10 @@ type NewsImage struct {
 	Link        string
 	Description string
 }
-
+type Results struct {
+	news    News
+	urlList []string
+}
 type MongoConfig struct {
 	Username string
 	Password string
@@ -53,41 +58,38 @@ type S3Config struct {
 }
 
 var (
-	coll     *mongo.Collection
-	svc      *s3.S3
-	s3Config S3Config
-	imageDir string = "files/download"
+	coll      *mongo.Collection
+	svc       *s3.S3
+	s3Config  S3Config
+	mode      string
+	publicURL string
 )
 
 func main() {
 	err := godotenv.Load()
+	firstAttempt := Results{}
 	if err != nil {
 		log.Fatal("Unable to load .env:", err)
 	}
 
-	mongoConfig := MongoConfig{
-		Username: os.Getenv("USERNAME"),
-		Password: os.Getenv("PASSWORD"),
-		Host:     os.Getenv("HOST"),
-		Port:     os.Getenv("PORT"),
-	}
-
-	credential := options.Credential{
-		Username: mongoConfig.Username,
-		Password: mongoConfig.Password,
-	}
-
-	client, err := mongo.NewClient(options.Client().ApplyURI("mongodb://" + mongoConfig.Host + ":" + mongoConfig.Port).SetAuth(credential))
+	username := os.Getenv("MONGOUSERNAME")
+	password := os.Getenv("MONGOPASSWORD")
+	hostname := os.Getenv("MONGOHOST")
+	port := os.Getenv("MONGOPORT")
+	mongoDatabase := os.Getenv("MONGODATABASE")
+	mongoCollection := os.Getenv("MONGOCOLLECTION")
+	mode = os.Getenv("IMAGEMODE")
+	imageDir := os.Getenv("LOCALIMAGEPATH")
+	loop, err := strconv.Atoi(os.Getenv("SCRAPELOOP"))
 	if err != nil {
-		log.Fatal(err)
+		// ... handle error
+		panic(err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
-	err = client.Connect(context.Background())
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	coll = client.Database("stock").Collection("news")
+	defer cancel()
+	client := Database.MongoConnect(username, password, hostname, port, ctx)
+	coll = client.Database(mongoDatabase).Collection(mongoCollection)
 
 	s3Config = S3Config{
 		Region:          os.Getenv("REGION"),
@@ -96,198 +98,168 @@ func main() {
 		SecretAccessKey: os.Getenv("S3SECRETACCESSKEY"),
 	}
 
-	sess, err := session.NewSession(&aws.Config{
-		Region:      aws.String(s3Config.Region),
-		Credentials: credentials.NewStaticCredentials(s3Config.AccessKeyID, s3Config.SecretAccessKey, ""),
-	})
-	if err != nil {
-		log.Fatal("Failed to create AWS session", err)
+	if mode == "aws" {
+		sess, err := session.NewSession(&aws.Config{
+			Region:      aws.String(s3Config.Region),
+			Credentials: credentials.NewStaticCredentials(s3Config.AccessKeyID, s3Config.SecretAccessKey, ""),
+		})
+		if err != nil {
+			log.Fatal("Failed to create AWS session", err)
+		} else {
+			fmt.Println("AWS session created!")
+		}
+
+		svc = s3.New(sess)
 	}
 
-	svc = s3.New(sess)
-
+	defer cancel()
 	workerPoolSize := 10
 	workerPool := make(chan struct{}, workerPoolSize)
+	var wg sync.WaitGroup
+	wg.Add(1)
 
-	// Set a 30 second timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	url := os.Getenv("CRAWLURL")
+	firstAttempt = getNews(url, imageDir, workerPool, &wg, true)
 
-	url := os.Getenv("TARGETURL")
-	getNews(url, 1, workerPool, ctx)
+	newsCh := make(chan News)
+	for i := 0; i < loop; i++ {
+		tmp := Results{}
+		newsList := make([]interface{}, 0)
+		todo := firstAttempt.urlList
+		for _, link := range todo {
+			wg.Add(1)
+			go func(newsLink string) {
+				tmp = getNews(newsLink, imageDir, workerPool, &wg, true)
+				todo = append(todo, tmp.urlList...)
+				newsCh <- tmp.news
+			}(link)
+			newsList = append(newsList, <-newsCh)
+		}
 
-	// Wait for the specified timeout duration
-	select {
-	case <-ctx.Done():
-		// Timeout expired, do nothing
+		result, err := coll.InsertMany(context.TODO(), newsList)
+
+		if err != nil {
+			panic(err)
+		} else {
+			fmt.Println("Data successfully inserted")
+		}
+
+		insertedCount := len(result.InsertedIDs)
+		fmt.Println("Inserted count:", insertedCount)
 	}
+	go func() {
+		close(newsCh)
+		wg.Wait()
+	}()
 }
 
-func getNews(url string, lap int, workerPool chan struct{}, ctx context.Context) {
-	if lap >= 3 {
-		return
-	}
-	lap += 1
-
+func getNews(url string, imgDir string, workerPool chan struct{}, wg *sync.WaitGroup, gatherUrlFlag bool) Results {
+	defer wg.Done()
+	workerPool <- struct{}{}
+	result := Results{}
+	urlList := []string{}
 	res, err := http.Get(url)
+
 	if err != nil {
+		fmt.Println("http.Get error!")
 		log.Fatal(err)
 	}
 	defer res.Body.Close()
 
 	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
+		fmt.Println("NewDocumentFromReader error!")
 		log.Fatal(err)
 	}
 
-	urlList := make(map[string]bool)
+	if gatherUrlFlag {
+		urlList = RetrieveUrlList(doc, url)
+	}
+
+	var news News
+	doc.Find("h1").Each(func(i int, s *goquery.Selection) {
+		newsTitle, exists := s.Attr("data-test-locator")
+		if newsTitle == "headline" && exists {
+			news.Title = s.Text()
+		}
+	})
+	news.Time = doc.Find("time").Text()
+	doc.Find("noscript").Remove()
+	var newsImages []NewsImage
+
+	// 提取圖片URL並下載
+	doc.Find("div.caas-body img").Each(func(i int, s *goquery.Selection) {
+		imgSrc, exists := s.Attr("src")
+		if !exists {
+			imgSrc, exists = s.Attr("data-src")
+			if !exists {
+				fmt.Println("image not found")
+				<-workerPool
+				return
+			}
+		}
+
+		s.AppendHtml("<p>{{img" + strconv.Itoa(i) + "}}<p>")
+		// Download the image from the URL
+		resp, err := http.Get(imgSrc)
+		if err != nil {
+			fmt.Println("Failed to download image:", err)
+			<-workerPool
+			return
+		}
+		defer resp.Body.Close()
+
+		contentType := resp.Header.Get("Content-Type")
+		fileExtension := mimeToExtension(contentType)
+
+		// Get the filename from the URL
+		filename := ""
+		if strings.LastIndex(imgSrc, "/") != -1 {
+			filename = imgSrc[strings.LastIndex(imgSrc, "/")+1:] + fileExtension
+		}
+
+		if mode == "aws" {
+			publicURL = AWSStorage.SaveImage(resp, imgSrc, filename, svc)
+		} else if mode == "local" {
+			publicURL = LocalStorage.SaveImage(imgSrc, filename, imgDir)
+		} else {
+			panic("Image download mode not set.")
+		}
+
+		figcaption := s.Closest("figure").Find("figcaption")
+		description := figcaption.Text()
+		figcaption.Remove()
+		newImage := NewsImage{
+			Link:        publicURL,
+			Description: description,
+		}
+		newsImages = append(newsImages, newImage)
+	})
+
+	news.Content = doc.Find("div.caas-body").Text()
+	news.Images = newsImages
+	news.Source = os.Getenv("CRAWLURLSOURCE")
+	news.Link = url
+
+	result.news = news
+	result.urlList = urlList
+	<-workerPool
+	return result
+}
+
+func RetrieveUrlList(doc *goquery.Document, domain string) []string {
+	result := []string{}
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
 		if exists && linkFilter(href) {
-			urlList[href] = true
+			if !strings.Contains(href, "https") {
+				href = domain + href
+			}
+			result = append(result, href)
 		}
 	})
 
-	var wg sync.WaitGroup
-	newsList := make([]interface{}, 0)
-
-	for link := range urlList {
-		// Acquire a worker slot from the worker pool
-		workerPool <- struct{}{}
-		wg.Add(1)
-
-		filter := bson.M{
-			"link": link,
-		}
-
-		// Perform a query to check if the document already exists
-		count, err := coll.CountDocuments(context.TODO(), filter)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// If count is greater than zero, the document already exists
-		if count > 0 {
-			return
-		} else {
-			getNews(link, lap, workerPool, ctx)
-		}
-
-		go func(des string, ctx context.Context) {
-			// Check if the context has been canceled
-			select {
-			case <-ctx.Done():
-				// Context canceled, stop the goroutine
-				return
-			default:
-				defer wg.Done()
-				nextRes, err := http.Get(des)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				defer nextRes.Body.Close()
-				nextDoc, err := goquery.NewDocumentFromReader(nextRes.Body)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				var news News
-				nextDoc.Find("h1").Each(func(i int, s *goquery.Selection) {
-					newsTitle, exists := s.Attr("data-test-locator")
-					if newsTitle == "headline" && exists {
-						news.Title = s.Text()
-					}
-				})
-				news.Time = nextDoc.Find("time").Text()
-				nextDoc.Find("noscript").Remove()
-				var newsImages []NewsImage
-
-				// 提取圖片URL並下載
-				nextDoc.Find("div.caas-body img").Each(func(i int, s *goquery.Selection) {
-					imgSrc, exists := s.Attr("src")
-					if !exists {
-						imgSrc, exists = s.Attr("data-src")
-						if !exists {
-							return
-						}
-					}
-
-					s.AppendHtml("<p>{{img" + strconv.Itoa(i) + "}}<p>")
-					// Download the image from the URL
-					resp, err := http.Get(imgSrc)
-					if err != nil {
-						fmt.Println("Failed to download image:", err)
-						return
-					}
-					defer resp.Body.Close()
-
-					contentType := resp.Header.Get("Content-Type")
-					fileExtension := mimeToExtension(contentType)
-
-					// Get the filename from the URL
-					filename := ""
-					fileKey := ""
-					if strings.LastIndex(imgSrc, "/") != -1 {
-						filename = imgSrc[strings.LastIndex(imgSrc, "/")+1:] + fileExtension
-						fileKey = "images/" + filename
-					}
-
-					// Create a new S3 object
-					object := &s3.PutObjectInput{
-						Bucket: aws.String(s3Config.Bucket),
-						Key:    aws.String(fileKey),
-					}
-					buffer := bytes.NewBuffer(nil)
-
-					// Copy the response body into the buffer
-					_, err = io.Copy(buffer, resp.Body)
-					if err != nil {
-						fmt.Println("Failed to copy image data to buffer:", err)
-						return
-					}
-
-					// Set the object's body to the buffer
-					object.Body = bytes.NewReader(buffer.Bytes())
-
-					// Upload the image to S3
-					_, err = svc.PutObject(object)
-					if err != nil {
-						fmt.Println("Failed to upload image to S3:", err)
-						return
-					}
-
-					publicURL := fmt.Sprintf("https://%s.s3-%s.amazonaws.com/%s", s3Config.Bucket, s3Config.Region, fileKey)
-					figcaption := s.Closest("figure").Find("figcaption")
-					description := figcaption.Text()
-					figcaption.Remove()
-					newImage := NewsImage{
-						Link:        publicURL,
-						Description: description,
-					}
-					newsImages = append(newsImages, newImage)
-				})
-
-				news.Content = nextDoc.Find("div.caas-body").Text()
-				news.Images = newsImages
-				news.Source = os.Getenv("CRAWLURLSOURCE")
-				news.Link = des
-				newsList = append(newsList, news)
-			}
-		}(link, ctx)
-	}
-	wg.Wait()
-
-	result, err := coll.InsertMany(context.TODO(), newsList)
-
-	if err != nil {
-		panic(err)
-	}
-
-	insertedCount := len(result.InsertedIDs)
-	fmt.Println("Inserted count:", insertedCount)
-
-	return
+	return result
 }
 
 func mimeToExtension(contentType string) string {
