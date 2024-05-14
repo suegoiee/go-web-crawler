@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"sync"
 	"time"
 
 	"josh/goCrawler/AWSStorage"
@@ -115,11 +114,9 @@ func main() {
 	defer cancel()
 	workerPoolSize := 10
 	workerPool := make(chan struct{}, workerPoolSize)
-	var wg sync.WaitGroup
-	wg.Add(1)
 
 	url := os.Getenv("CRAWLURL")
-	firstAttempt = getNews(url, imageDir, workerPool, &wg, true)
+	firstAttempt = getNews(url, imageDir, workerPool, true)
 
 	newsCh := make(chan News)
 	for i := 0; i < loop; i++ {
@@ -127,9 +124,8 @@ func main() {
 		newsList := make([]interface{}, 0)
 		todo := firstAttempt.urlList
 		for _, link := range todo {
-			wg.Add(1)
 			go func(newsLink string) {
-				tmp = getNews(newsLink, imageDir, workerPool, &wg, true)
+				tmp = getNews(newsLink, imageDir, workerPool, true)
 				todo = append(todo, tmp.urlList...)
 				newsCh <- tmp.news
 			}(link)
@@ -149,12 +145,10 @@ func main() {
 	}
 	go func() {
 		close(newsCh)
-		wg.Wait()
 	}()
 }
 
-func getNews(url string, imgDir string, workerPool chan struct{}, wg *sync.WaitGroup, gatherUrlFlag bool) Results {
-	defer wg.Done()
+func getNews(url string, imgDir string, workerPool chan struct{}, gatherUrlFlag bool) Results {
 	workerPool <- struct{}{}
 	result := Results{}
 	urlList := []string{}
